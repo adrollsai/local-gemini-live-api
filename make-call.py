@@ -1,42 +1,55 @@
 import os
-from twilio.rest import Client
+import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
 # --- CONFIGURATION ---
-account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-from_number = os.getenv("TWILIO_PHONE_NUMBER")
-to_number = os.getenv("YOUR_PHONE_NUMBER")
-base_url = os.getenv("SERVER_URL")
+api_key = os.getenv("EXOTEL_API_KEY")
+api_token = os.getenv("EXOTEL_API_TOKEN")
+subdomain = os.getenv("EXOTEL_SUBDOMAIN")
+account_sid = os.getenv("EXOTEL_SID")
+flow_id = os.getenv("EXOTEL_FLOW_ID") # <--- NEW: Flow ID from Dashboard
+exophone = os.getenv("EXOTEL_PHONE_NUMBER") 
+user_number = os.getenv("YOUR_PHONE_NUMBER")
 
-# Validate configuration
-if not all([account_sid, auth_token, from_number, to_number, base_url]):
-    print("❌ Error: Missing variables in .env file.")
+# Validate
+if not all([api_key, api_token, subdomain, account_sid, flow_id, exophone, user_number]):
+    print("❌ Error: Missing variables in .env file (Check EXOTEL_FLOW_ID).")
     exit(1)
 
-# Ensure the URL ends with /twiml (endpoints defined in server.py)
-webhook_url = f"{base_url.rstrip('/')}/twiml"
+# Exotel API Endpoint
+url = f"https://{subdomain}.exotel.com/v1/Accounts/{account_sid}/Calls/connect.json"
+
+# The logic: 
+# 1. Exotel dials 'From' (Your mobile).
+# 2. When you pick up, it executes the 'Url' (Your Flow/Stream).
+flow_url = f"http://my.exotel.com/{account_sid}/exoml/start_voice/{flow_id}"
 
 print(f"📞 Initiating call...")
-print(f"   From: {from_number}")
-print(f"   To:   {to_number}")
-print(f"   URL:  {webhook_url}")
+print(f"   Dialing User: {user_number}")
+print(f"   Connecting to Flow ID: {flow_id}")
 
 try:
-    # Initialize Twilio Client
-    client = Client(account_sid, auth_token)
+    payload = {
+        'From': user_number,       # Call YOU first
+        'CallerId': exophone,      # Show Exophone on your screen
+        'Url': flow_url,           # Connect to the Stream Flow
+        'CallType': "trans"        # Try Transactional to bypass DND
+    }
 
-    # Make the call
-    call = client.calls.create(
-        to=to_number,
-        from_=from_number,
-        url=webhook_url
+    response = requests.post(
+        url,
+        auth=(api_key, api_token),
+        data=payload
     )
 
-    print(f"\n✅ Call initiated! SID: {call.sid}")
+    if response.status_code == 200:
+        data = response.json()
+        print(f"\n✅ Call initiated! SID: {data.get('Call', {}).get('Sid')}")
+    else:
+        print(f"\n❌ Failed: {response.status_code}")
+        print(f"   Response: {response.text}")
 
 except Exception as e:
-    print(f"\n❌ Failed to make call: {e}")
+    print(f"\n❌ Error: {e}")
