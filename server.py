@@ -5,214 +5,206 @@ import audioop
 import uvicorn
 import logging
 import os
+import time
 import sys
-import traceback
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from google import genai
-from pydantic import BaseModel, ValidationError
-from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 # --- CONFIGURATION ---
-PORT = int(os.getenv("PORT", 5000))
-API_KEY = os.getenv("GOOGLE_API_KEY")
-# Using 2.0 Flash for low latency
-MODEL = os.getenv("MODE")
+# Using 2.0 Flash for significantly lower latency in real-time loops
+MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
-# Audio Configuration
-EXOTEL_SAMPLE_RATE = 8000
-GEMINI_SAMPLE_RATE = 24000  # Gemini 2.0 Flash native output
-INPUT_SAMPLE_RATE = 16000   # Gemini prefers 16k input
-# VAD Threshold: 200 is very sensitive (picks up whispers), 
-# preventing the "no sound" issue while still filtering empty static.
-SILENCE_THRESHOLD = 200 
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_API_KEY in .env file")
 
-# Instructions for the bot
-SYSTEM_INSTRUCTION = """
-You are a helpful logistics customer service assistant. 
-Your goal is to answer questions about delivery status and rates.
-Keep your responses concise (1-2 sentences) to reduce latency on the phone line.
-Speak naturally and professionally.
-"""
+PORT = int(os.environ.get("PORT", 5000))
+HOST = "0.0.0.0"
 
-# --- LOGGING SETUP ---
+# --- EXOTEL SPECS ---
+# Exotel requires 16-bit PCM @ 8kHz. Minimum chunk size 3200 bytes (200ms).
+CHUNK_SIZE = 3200 
+# Pacing: Deliver audio slightly faster than real-time to prevent robotic sound
+PACING_INTERVAL = 0.185
+
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Exotel-Gemini")
+logger = logging.getLogger("ExotelGemini")
 
 app = FastAPI()
+client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1alpha'})
 
-if not API_KEY:
-    logger.error("❌ GOOGLE_API_KEY not found in .env file. Exiting.")
-    sys.exit(1)
-
-client = genai.Client(api_key=API_KEY, http_options={'api_version': 'v1alpha'})
-
-# --- DATA MODELS (Restoring Robustness) ---
-class MediaFormat(BaseModel):
-    encoding: str
-    sample_rate: int
-    bit_rate: str
-
-class StartData(BaseModel):
-    stream_sid: str
-    call_sid: str
-    media_format: MediaFormat
-
-class MediaData(BaseModel):
-    payload: str
-    track: str
-    chunk: Optional[str] = None
-    timestamp: Optional[str] = None
-
-class ExotelEvent(BaseModel):
-    event: str
-    stream_sid: Optional[str] = None
-    start: Optional[StartData] = None
-    media: Optional[MediaData] = None
-    stop: Optional[Dict[str, Any]] = None
-
-# --- AUDIO PROCESSING UTILITIES ---
-def pcm_to_ulaw(pcm_data: bytes) -> str:
-    """Converts PCM (16-bit, various rates) to Exotel compatible Mu-Law (8kHz)."""
+# --- AUDIO UTILS ---
+def telephony_to_gemini(media_payload):
     try:
-        # Downsample from Gemini (24k) to Exotel (8k)
-        pcm_8k, _ = audioop.ratecv(pcm_data, 2, 1, GEMINI_SAMPLE_RATE, EXOTEL_SAMPLE_RATE, None)
-        # Convert Linear PCM to Mu-Law
-        ulaw_data = audioop.lin2ulaw(pcm_8k, 2)
-        return base64.b64encode(ulaw_data).decode("utf-8")
+        # Exotel (16-bit PCM 8k) -> Gemini (PCM 16k)
+        pcm_8k = base64.b64decode(media_payload)
+        return audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)[0]
     except Exception as e:
-        logger.error(f"Audio Output Conversion Error: {e}")
-        return ""
+        logger.error(f"Decode Error: {e}")
+        return None
 
-def ulaw_to_pcm(ulaw_payload: str) -> bytes:
-    """Converts Exotel Mu-Law (8kHz) to PCM (16kHz) for Gemini."""
+def gemini_to_telephony(pcm_data):
     try:
-        ulaw_data = base64.b64decode(ulaw_payload)
-        pcm_8k = audioop.ulaw2lin(ulaw_data, 2)
-        # Upsample from 8k to 16k for better recognition by Gemini
-        pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, EXOTEL_SAMPLE_RATE, INPUT_SAMPLE_RATE, None)
-        return pcm_16k
+        # Gemini (PCM 24k) -> Exotel (PCM 8k)
+        return audioop.ratecv(pcm_data, 2, 1, 24000, 8000, None)[0]
     except Exception as e:
-        logger.error(f"Audio Input Conversion Error: {e}")
-        return b""
+        logger.error(f"Encode Error: {e}")
+        return None
 
-# --- MAIN WEBSOCKET HANDLER ---
-@app.get("/")
-async def root():
-    return {"status": "running", "service": "Exotel Gemini Relay"}
-
+# --- WEBSOCKET HANDLER ---
 @app.websocket("/media-stream")
-async def media_stream(websocket: WebSocket):
+async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("✅ Exotel WebSocket Connected")
 
-    session_config = {
+    audio_input_queue = asyncio.Queue(maxsize=10)
+    stream_sid = None
+    stream_key_name = "stream_sid" 
+    is_speaking = False 
+    socket_lock = asyncio.Lock()
+
+    config = {
         "response_modalities": ["AUDIO"],
-        "system_instruction": SYSTEM_INSTRUCTION
+        "speech_config": {
+            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}
+        }
     }
 
     try:
-        async with client.aio.live.connect(model=MODEL, config=session_config) as session:
-            logger.info(f"🔹 Connected to Gemini Session: {MODEL}")
+        async with client.aio.live.connect(model=MODEL, config=config) as session:
+            logger.info(f"🔹 Connected to Gemini: {MODEL}")
             
-            # --- FIX 3: WAKE UP MESSAGE ---
-            # Force Gemini to speak immediately so you know the connection works.
-            # 'end_of_turn=True' tells Gemini to reply.
-            await session.send(input="Hello, introduce yourself.", end_of_turn=True)
-            logger.info("👋 Sent wake-up trigger to Gemini")
+            # Initial AI greeting
+            await session.send(input="Hello! How can I help you today?", end_of_turn=True)
 
-            # --- OUTBOUND TASK (Gemini -> Exotel) ---
-            async def send_audio_to_exotel():
+            # --- 1. RECEIVE FROM EXOTEL (Handles incoming User Voice) ---
+            async def receive_from_exotel():
+                nonlocal stream_sid, stream_key_name
+                last_speech_log = 0
+                try:
+                    while True:
+                        message = await websocket.receive_text()
+                        data = json.loads(message)
+                        
+                        if data.get("event") == "start":
+                            logger.info(f"📩 START EVENT: {json.dumps(data)}")
+                            stream_key_name = "stream_sid" if "stream_sid" in data else "streamSid"
+                            stream_sid = data.get("stream_sid") or data.get("streamSid") or data.get("start", {}).get("stream_sid")
+                            logger.info(f"🔑 Stream ID Captured: {stream_sid}")
+
+                        elif data.get("event") == "media":
+                            # LOG USER SPEECH: Track if user audio is reaching the server
+                            current_time = time.time()
+                            if current_time - last_speech_log > 2:
+                                logger.info("🎤 User is speaking... (Audio reaching server)")
+                                last_speech_log = current_time
+
+                            payload = data["media"]["payload"]
+                            pcm_16k = telephony_to_gemini(payload)
+                            if pcm_16k:
+                                if audio_input_queue.full():
+                                    audio_input_queue.get_nowait()
+                                await audio_input_queue.put(pcm_16k)
+                        
+                        elif data.get("event") == "stop":
+                            logger.info("🛑 Exotel Stop Signal Received")
+                            break
+                except Exception as e:
+                    logger.error(f"Exotel Rx Error: {e}")
+                finally:
+                    await audio_input_queue.put(None)
+
+            # --- 2. SEND TO GEMINI (Feed User Audio) ---
+            async def send_to_gemini():
+                try:
+                    while True:
+                        pcm_data = await audio_input_queue.get()
+                        if pcm_data is None: break
+                        await session.send_realtime_input(
+                            audio={"data": pcm_data, "mime_type": "audio/pcm"}
+                        )
+                except Exception as e:
+                    logger.error(f"Gemini Tx Error: {e}")
+
+            # --- 3. RECEIVE FROM GEMINI (Handle AI Voice & Barge-in) ---
+            async def receive_from_gemini():
+                nonlocal is_speaking
+                out_buffer = b""
+                
                 try:
                     while True:
                         async for response in session.receive():
-                            # Handle Audio
-                            if response.server_content and response.server_content.model_turn:
-                                for part in response.server_content.model_turn.parts:
+                            # --- BARGE-IN DETECTION ---
+                            if response.server_content and response.server_content.interrupted:
+                                logger.info("⚡ BARGE-IN: User interrupted AI. Clearing buffers.")
+                                is_speaking = False
+                                out_buffer = b"" 
+                                
+                                # Immediately tell Exotel to clear its playback buffer
+                                if stream_sid:
+                                    async with socket_lock:
+                                        await websocket.send_json({
+                                            "event": "clear",
+                                            stream_key_name: stream_sid
+                                        })
+                                continue
+
+                            # --- AUDIO PROCESSING ---
+                            server_content = response.server_content
+                            if server_content and server_content.model_turn:
+                                for part in server_content.model_turn.parts:
                                     if part.inline_data:
-                                        payload = pcm_to_ulaw(part.inline_data.data)
-                                        if payload:
-                                            msg = {
-                                                "event": "media",
-                                                "media": {
-                                                    "payload": payload,
-                                                    "track": "outbound"
-                                                }
-                                            }
-                                            await websocket.send_text(json.dumps(msg))
+                                        if not is_speaking:
+                                            logger.info("🗣️ Gemini generating response...")
+                                        is_speaking = True
+                                        
+                                        pcm_24k = part.inline_data.data
+                                        chunk_8k = gemini_to_telephony(pcm_24k)
+                                        if chunk_8k:
+                                            out_buffer += chunk_8k
+
+                                        # Strict 3200-byte chunking for Exotel stability
+                                        while len(out_buffer) >= CHUNK_SIZE:
+                                            to_send = out_buffer[:CHUNK_SIZE]
+                                            out_buffer = out_buffer[CHUNK_SIZE:]
+                                            
+                                            if stream_sid:
+                                                payload_str = base64.b64encode(to_send).decode("utf-8")
+                                                async with socket_lock:
+                                                    await websocket.send_json({
+                                                        "event": "media",
+                                                        stream_key_name: stream_sid,
+                                                        "media": {"payload": payload_str}
+                                                    })
+                                            # Pace the packets
+                                            await asyncio.sleep(PACING_INTERVAL)
                             
-                            # Handle Turn Completion (Optional: clear buffers)
-                            if response.server_content and response.server_content.turn_complete:
-                                # logger.info("🔹 Bot finished speaking") 
-                                pass
+                            if server_content and server_content.turn_complete:
+                                logger.info("🔹 Gemini turn complete.")
+                                is_speaking = False
 
-                except asyncio.CancelledError:
-                    pass
                 except Exception as e:
-                    logger.error(f"Error in outbound task: {e}")
-                    traceback.print_exc()
+                    logger.error(f"❌ Gemini Rx Error: {e}")
 
-            # Start the outbound background task
-            outbound_task = asyncio.create_task(send_audio_to_exotel())
-
-            # --- INBOUND LOOP (Exotel -> Gemini) ---
-            stream_sid = None
-            try:
-                while True:
-                    data = await websocket.receive_text()
-                    
-                    try:
-                        event_data = json.loads(data)
-                        # Pydantic validation for robustness
-                        event = ExotelEvent(**event_data)
-                    except ValidationError as ve:
-                        logger.warning(f"Invalid Event format: {ve}")
-                        continue
-                    except json.JSONDecodeError:
-                        continue
-
-                    if event.event == "start":
-                        stream_sid = event.start.stream_sid
-                        logger.info(f"📩 Stream Started: {stream_sid}")
-
-                    elif event.event == "media" and event.media:
-                        # 1. Process Audio
-                        pcm_audio = ulaw_to_pcm(event.media.payload)
-                        
-                        # 2. VAD Check (Fix for Latency & Silence)
-                        rms = audioop.rms(pcm_audio, 2)
-                        
-                        if rms > SILENCE_THRESHOLD:
-                            # --- FIX 1: NO LOGGING HERE ---
-                            # Sending audio silently to avoid spamming logs
-                            await session.send(input={"data": pcm_audio, "mime_type": "audio/pcm"}, end_of_turn=False)
-                        else:
-                            # Silence detected. We ignore it to prevent Gemini from 
-                            # waiting 5s for you to "finish" a sentence of silence.
-                            pass
-
-                    elif event.event == "stop":
-                        logger.info("🛑 Stop Event Received")
-                        break
-
-            except WebSocketDisconnect:
-                logger.info("🔌 WebSocket Disconnected from Exotel")
-            except Exception as e:
-                logger.error(f"⚠️ Error in inbound loop: {e}")
-            finally:
-                outbound_task.cancel()
-                logger.info("🔒 Closing session")
+            # Run concurrency tasks
+            await asyncio.gather(receive_from_exotel(), send_to_gemini(), receive_from_gemini())
 
     except Exception as e:
-        logger.error(f"🔥 Critical Connection Error: {e}")
-        await websocket.close()
+        logger.error(f"🔥 Critical Failure: {e}")
+    finally:
+        logger.info("👋 Call Session Closed")
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+if __name__ == '__main__':
+    # Render configures a "PORT" env var. We must listen on it.
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting server on port {port}...")
+    uvicorn.run(app, host='0.0.0.0', port=port)
