@@ -203,5 +203,8 @@ async def handle_media_stream(websocket: WebSocket):
     finally:
         logger.info("👋 Call Session Closed")
 
-if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT)
+if __name__ == '__main__':
+    # Render configures a "PORT" env var. We must listen on it.
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting server on port {port}...")
+    uvicorn.run(app, host='0.0.0.0', port=port)

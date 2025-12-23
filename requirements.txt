@@ -1,6 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
+google-genai
 python-dotenv
 requests
-google-genai
 websockets
