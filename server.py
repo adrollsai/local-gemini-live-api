@@ -133,6 +133,7 @@ async def run_media_stream(websocket: WebSocket, encoded_context: str = None):
     2. Keep your responses SHORT and CONCISE (1-2 sentences maximum). This is a voice call.
     3. Be professional, friendly, and helpful.
     4. If the user is silent or just says "hello", re-state the purpose of the call.
+    5. Speak in the language user wants to speak in.
     """
 
     config = {
