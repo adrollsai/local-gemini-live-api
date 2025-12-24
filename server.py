@@ -7,7 +7,8 @@ import logging
 import os
 import time
 import sys
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.websockets import WebSocketDisconnect
 from google import genai
 from dotenv import load_dotenv
 
@@ -19,10 +20,11 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 PORT = int(os.environ.get("PORT", 5000))
 HOST = "0.0.0.0"
 
-# Exotel Audio Specs
+# Audio Settings
 CHUNK_SIZE = 3200 
 PACING_INTERVAL = 0.185
-SILENCE_THRESHOLD = 500 # Ignore audio quieter than this (adjust if needed)
+# Increased threshold to ignore background noise/breathing
+SILENCE_THRESHOLD = 1000 
 
 # Logging
 logging.basicConfig(
@@ -35,6 +37,7 @@ logger = logging.getLogger("ExotelGemini")
 app = FastAPI()
 client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1alpha'})
 
+# --- HELPER FUNCTIONS ---
 def telephony_to_gemini(media_payload):
     try:
         pcm_8k = base64.b64decode(media_payload)
@@ -50,19 +53,28 @@ def gemini_to_telephony(pcm_data):
         logger.error(f"Encode Error: {e}")
         return None
 
+@app.get("/")
+async def health_check():
+    return {"status": "active", "service": "AdRolls AI Voice Agent"}
+
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
     
-    # --- DEBUGGING CONTEXT ---
-    # Log the exact URL params we received to debug why name is missing
-    logger.info(f"🔍 FULL CONNECTION URL: {websocket.url}")
-    logger.info(f"🔍 RAW QUERY PARAMS: {websocket.query_params}")
-
-    user_name = websocket.query_params.get("name", "Valued Customer")
-    call_notes = websocket.query_params.get("notes", "General inquiry")
+    # --- 1. ROBUST CONTEXT EXTRACTION ---
+    # Log everything to debug why name might be missing
+    query_params = dict(websocket.query_params)
+    logger.info(f"🔍 Connection Query Params: {query_params}")
     
-    logger.info(f"✅ Context Loaded -> Name: {user_name} | Notes: {call_notes}")
+    # Try getting name from Query Params, default to "Valued Customer"
+    user_name = query_params.get("name", "Valued Customer")
+    call_notes = query_params.get("notes", "General inquiry")
+    
+    # Fix for double-encoded URLs (sometimes spaces become + or %20)
+    user_name = user_name.replace("+", " ").replace("%20", " ")
+    call_notes = call_notes.replace("+", " ").replace("%20", " ")
+
+    logger.info(f"✅ AI Initialized for: {user_name} | Topic: {call_notes}")
 
     audio_input_queue = asyncio.Queue(maxsize=10)
     stream_sid = None
@@ -70,13 +82,17 @@ async def handle_media_stream(websocket: WebSocket):
     is_speaking = False 
     socket_lock = asyncio.Lock()
 
+    # --- 2. SYSTEM INSTRUCTION ---
     SYSTEM_INSTRUCTION = f"""
-    You are an AI assistant for AdRolls calling {user_name}.
-    Purpose: {call_notes}.
+    You are an AI sales assistant for AdRolls. You are currently on a phone call with {user_name}.
     
-    IMPORTANT:
-    - You MUST acknowledge the purpose of the call in your very first sentence or immediately after they say hello.
-    - Keep it short.
+    CONTEXT & GOAL:
+    The purpose of this call is: {call_notes}.
+    
+    RULES:
+    1. START IMMEDIATELY: As soon as you hear the user, acknowledge the purpose of the call.
+    2. BE CONCISE: Use short sentences (under 15 words). No long monologues.
+    3. BE NATURAL: If the user says "Hello?", reply "Hi {user_name}, I'm calling from AdRolls about {call_notes}."
     """
 
     config = {
@@ -89,11 +105,12 @@ async def handle_media_stream(websocket: WebSocket):
 
     try:
         async with client.aio.live.connect(model=MODEL, config=config) as session:
-            logger.info("🔹 Connected to Gemini")
+            logger.info("🔹 Gemini Live Session Connected")
             
-            # Send initial greeting immediately
-            await session.send(input=f"Hi, I'm calling from AdRolls about {call_notes}. Is this {user_name}?", end_of_turn=True)
+            # Send initial Greeting so AI knows to start
+            await session.send(input=f"Hi, I am calling from AdRolls about {call_notes}. Is this {user_name}?", end_of_turn=True)
 
+            # --- EXOTEL LISTENER TASK ---
             async def receive_from_exotel():
                 nonlocal stream_sid, stream_key_name
                 last_speech_log = 0
@@ -112,25 +129,33 @@ async def handle_media_stream(websocket: WebSocket):
                             pcm_16k = telephony_to_gemini(payload)
                             
                             if pcm_16k:
-                                # SILENCE DETECTION: Only log if volume > threshold
+                                # SILENCE GATE: Only process if volume > threshold
                                 rms = audioop.rms(pcm_16k, 2)
-                                current_time = time.time()
-                                if rms > SILENCE_THRESHOLD and (current_time - last_speech_log > 2):
-                                    logger.info(f"🎤 User Speaking (RMS: {rms})")
-                                    last_speech_log = current_time
-
-                                if audio_input_queue.full():
-                                    audio_input_queue.get_nowait()
-                                await audio_input_queue.put(pcm_16k)
+                                
+                                # Log occasionally to prove it's working, but only if loud enough
+                                if rms > SILENCE_THRESHOLD:
+                                    current_time = time.time()
+                                    if current_time - last_speech_log > 5:
+                                        logger.info(f"🎤 Voice detected (RMS: {rms})")
+                                        last_speech_log = current_time
+                                    
+                                    # Send to buffer
+                                    if audio_input_queue.full():
+                                        audio_input_queue.get_nowait()
+                                    await audio_input_queue.put(pcm_16k)
                         
                         elif data.get("event") == "stop":
-                            logger.info("🛑 Exotel Stop Event")
+                            logger.info("🛑 Exotel sent Stop event")
                             break
+                except WebSocketDisconnect:
+                    logger.info("⚠️ WebSocket Disconnected by Client")
+                    raise
                 except Exception as e:
                     logger.error(f"Exotel Rx Error: {e}")
                 finally:
                     await audio_input_queue.put(None)
 
+            # --- GEMINI SENDER TASK ---
             async def send_to_gemini():
                 try:
                     while True:
@@ -142,6 +167,7 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Gemini Tx Error: {e}")
 
+            # --- GEMINI RECEIVER TASK ---
             async def receive_from_gemini():
                 nonlocal is_speaking
                 out_buffer = b""
@@ -149,15 +175,18 @@ async def handle_media_stream(websocket: WebSocket):
                     while True:
                         async for response in session.receive():
                             if response.server_content and response.server_content.interrupted:
-                                logger.info("⚡ Interrupted")
+                                logger.info("⚡ AI Interrupted")
                                 is_speaking = False
                                 out_buffer = b"" 
                                 if stream_sid:
                                     async with socket_lock:
-                                        await websocket.send_json({
-                                            "event": "clear",
-                                            stream_key_name: stream_sid
-                                        })
+                                        # Safe send, ignore if socket closed
+                                        try:
+                                            await websocket.send_json({
+                                                "event": "clear",
+                                                stream_key_name: stream_sid
+                                            })
+                                        except: pass
                                 continue
 
                             server_content = response.server_content
@@ -165,7 +194,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 for part in server_content.model_turn.parts:
                                     if part.inline_data:
                                         if not is_speaking:
-                                            logger.info("🗣️ AI Speaking")
+                                            logger.info("🗣️ AI Speaking response...")
                                             is_speaking = True
                                         
                                         pcm_24k = part.inline_data.data
@@ -180,11 +209,14 @@ async def handle_media_stream(websocket: WebSocket):
                                             if stream_sid:
                                                 payload_str = base64.b64encode(to_send).decode("utf-8")
                                                 async with socket_lock:
-                                                    await websocket.send_json({
-                                                        "event": "media",
-                                                        stream_key_name: stream_sid,
-                                                        "media": {"payload": payload_str}
-                                                    })
+                                                    try:
+                                                        await websocket.send_json({
+                                                            "event": "media",
+                                                            stream_key_name: stream_sid,
+                                                            "media": {"payload": payload_str}
+                                                        })
+                                                    except Exception:
+                                                        break # Socket likely closed
                                                 await asyncio.sleep(PACING_INTERVAL)
                             
                             if server_content and server_content.turn_complete:
@@ -193,14 +225,23 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Gemini Rx Error: {e}")
 
+            # Run all tasks
             await asyncio.gather(receive_from_exotel(), send_to_gemini(), receive_from_gemini())
 
+    except WebSocketDisconnect:
+        logger.info("👋 Client Disconnected")
     except Exception as e:
-        logger.error(f"🔥 Critical Failure: {e}")
+        logger.error(f"🔥 Critical Server Error: {e}")
     finally:
-        logger.info("👋 Session Ended")
-        await websocket.close()
+        logger.info("🔒 Closing Connection")
+        # SAFE CLOSE PATTERN to prevent RuntimeError
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass # Already closed
+        except Exception as e:
+            logger.info(f"Socket close ignored: {e}")
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 5000))
     uvicorn.run(app, host='0.0.0.0', port=port)
