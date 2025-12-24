@@ -16,7 +16,7 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # Using 2.0 Flash for significantly lower latency in real-time loops
-MODEL = "gemini-2.0-flash-exp" # Make sure this model is available to your API key, or use "gemini-2.0-flash-realtime-exp" if strictly required
+MODEL = "gemini-2.5-flash-native-audio-preview-12-2025" # Make sure this model is available to your API key, or use "gemini-2.0-flash-realtime-exp" if strictly required
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
