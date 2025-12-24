@@ -16,12 +16,13 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # Using 2.0 Flash for significantly lower latency in real-time loops
-MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
+MODEL = "gemini-2.0-flash-exp" # Make sure this model is available to your API key, or use "gemini-2.0-flash-realtime-exp" if strictly required
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY in .env file")
 
+# Render configures a "PORT" env var
 PORT = int(os.environ.get("PORT", 5000))
 HOST = "0.0.0.0"
 
@@ -46,6 +47,8 @@ client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1al
 def telephony_to_gemini(media_payload):
     try:
         # Exotel (16-bit PCM 8k) -> Gemini (PCM 16k)
+        # Note: If Exotel sends Mulaw, you might need audioop.ulaw2lin first. 
+        # Keeping your existing logic assuming raw PCM.
         pcm_8k = base64.b64decode(media_payload)
         return audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)[0]
     except Exception as e:
@@ -64,7 +67,13 @@ def gemini_to_telephony(pcm_data):
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
-    logger.info("✅ Exotel WebSocket Connected")
+    
+    # --- 1. EXTRACT CONTEXT FROM URL ---
+    query_params = websocket.query_params
+    user_name = query_params.get("name", "Valued Customer")
+    call_notes = query_params.get("notes", "General inquiry")
+    
+    logger.info(f"✅ Exotel WebSocket Connected. Calling: {user_name}. Context: {call_notes}")
 
     audio_input_queue = asyncio.Queue(maxsize=10)
     stream_sid = None
@@ -72,21 +81,35 @@ async def handle_media_stream(websocket: WebSocket):
     is_speaking = False 
     socket_lock = asyncio.Lock()
 
+    # --- 2. DYNAMIC SYSTEM INSTRUCTION ---
+    SYSTEM_INSTRUCTION = f"""
+    You are an AI assistant for AdRolls calling {user_name}.
+    Context of the call: {call_notes}.
+    
+    Guidelines:
+    1. Be professional but conversational.
+    2. Keep responses concise (1-2 sentences) as this is a phone call.
+    3. Start by verifying you are speaking to {user_name}.
+    4. If the user interrupts, stop talking immediately.
+    """
+
     config = {
         "response_modalities": ["AUDIO"],
         "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}
-        }
+            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}} # Puck, Charon, Aoede, Fenrir, Kore
+        },
+        "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]}
     }
 
     try:
         async with client.aio.live.connect(model=MODEL, config=config) as session:
             logger.info(f"🔹 Connected to Gemini: {MODEL}")
             
-            # Initial AI greeting
-            await session.send(input="Hello! How can I help you today?", end_of_turn=True)
+            # --- 3. TRIGGER INITIAL GREETING ---
+            # We send a text prompt to kickstart the conversation based on the context
+            await session.send(input=f"Hello, am I speaking with {user_name}?", end_of_turn=True)
 
-            # --- 1. RECEIVE FROM EXOTEL (Handles incoming User Voice) ---
+            # --- RECEIVE FROM EXOTEL (Handles incoming User Voice) ---
             async def receive_from_exotel():
                 nonlocal stream_sid, stream_key_name
                 last_speech_log = 0
@@ -123,7 +146,7 @@ async def handle_media_stream(websocket: WebSocket):
                 finally:
                     await audio_input_queue.put(None)
 
-            # --- 2. SEND TO GEMINI (Feed User Audio) ---
+            # --- SEND TO GEMINI (Feed User Audio) ---
             async def send_to_gemini():
                 try:
                     while True:
@@ -135,7 +158,7 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Gemini Tx Error: {e}")
 
-            # --- 3. RECEIVE FROM GEMINI (Handle AI Voice & Barge-in) ---
+            # --- RECEIVE FROM GEMINI (Handle AI Voice & Barge-in) ---
             async def receive_from_gemini():
                 nonlocal is_speaking
                 out_buffer = b""
@@ -165,7 +188,7 @@ async def handle_media_stream(websocket: WebSocket):
                                     if part.inline_data:
                                         if not is_speaking:
                                             logger.info("🗣️ Gemini generating response...")
-                                        is_speaking = True
+                                            is_speaking = True
                                         
                                         pcm_24k = part.inline_data.data
                                         chunk_8k = gemini_to_telephony(pcm_24k)
@@ -185,8 +208,8 @@ async def handle_media_stream(websocket: WebSocket):
                                                         stream_key_name: stream_sid,
                                                         "media": {"payload": payload_str}
                                                     })
-                                            # Pace the packets
-                                            await asyncio.sleep(PACING_INTERVAL)
+                                                # Pace the packets
+                                                await asyncio.sleep(PACING_INTERVAL)
                             
                             if server_content and server_content.turn_complete:
                                 logger.info("🔹 Gemini turn complete.")
