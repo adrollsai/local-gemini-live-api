@@ -17,7 +17,7 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # Using Flash model for low latency
-MODEL = "gemini-2.0-flash-exp"
+MODEL = os.environ.get("MODEL") || "gemini-2.5-flash-native-audio-preview-12-2025"
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
