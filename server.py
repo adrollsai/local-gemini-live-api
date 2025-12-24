@@ -83,14 +83,14 @@ async def handle_media_stream(websocket: WebSocket):
 
     # --- 2. DYNAMIC SYSTEM INSTRUCTION ---
     SYSTEM_INSTRUCTION = f"""
-    You are an AI assistant for AdRolls calling {user_name}.
-    Context of the call: {call_notes}.
+    You are an AI assistant for AdRolls. You are calling {user_name}.
+    
+    The SPECIFIC GOAL of this call is: {call_notes}.
     
     Guidelines:
-    1. Be professional but conversational.
-    2. Keep responses concise (1-2 sentences) as this is a phone call.
-    3. Start by verifying you are speaking to {user_name}.
-    4. If the user interrupts, stop talking immediately.
+    - You MUST mention the goal of the call immediately after verifying the user's name.
+    - Keep responses concise (1-2 sentences).
+    - Be professional and helpful.
     """
 
     config = {
@@ -107,7 +107,8 @@ async def handle_media_stream(websocket: WebSocket):
             
             # --- 3. TRIGGER INITIAL GREETING ---
             # We send a text prompt to kickstart the conversation based on the context
-            await session.send(input=f"Hello, am I speaking with {user_name}?", end_of_turn=True)
+            # New
+await session.send(input=f"Hello, I am calling from AdRolls regarding {call_notes}. Am I speaking with {user_name}?", end_of_turn=True)
 
             # --- RECEIVE FROM EXOTEL (Handles incoming User Voice) ---
             async def receive_from_exotel():
