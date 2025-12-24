@@ -17,7 +17,7 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # Using Flash model for low latency
-MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+MODEL = "gemini-2.0-flash-exp"
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
@@ -78,28 +78,42 @@ def gemini_to_telephony(pcm_data):
 async def health_check():
     return {"status": "active", "service": "Exotel AI Server"}
 
-# --- MAIN WEBSOCKET HANDLER ---
+# --- CORE LOGIC (Extracted to keep functionality intact) ---
 
-@app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket):
+async def run_media_stream(websocket: WebSocket, encoded_context: str = None):
     await websocket.accept()
     
     # --- 1. ROBUST CONTEXT EXTRACTION ---
-    # We try to get parameters from the URL. 
-    query_params = dict(websocket.query_params)
-    
-    # Log connection details for debugging
-    logger.info(f"📞 New Connection. Params: {query_params}")
+    user_name = "Valued Customer"
+    call_notes = "General inquiry"
 
-    # Extract or Default
-    user_name = query_params.get("name", "Valued Customer")
-    call_notes = query_params.get("notes", "General inquiry")
+    # STRATEGY A: Try Path Parameter (Base64 Encoded) - The Fix
+    if encoded_context:
+        try:
+            # Handle Base64 Padding
+            padding = '=' * (-len(encoded_context) % 4)
+            decoded_bytes = base64.urlsafe_b64decode(encoded_context + padding)
+            decoded_str = decoded_bytes.decode("utf-8")
+            data = json.loads(decoded_str)
+            
+            user_name = data.get("name", user_name)
+            call_notes = data.get("notes", call_notes)
+            logger.info(f"✅ Context Decoded from Path: {user_name} | {call_notes}")
+        except Exception as e:
+            logger.error(f"⚠️ Path Decode Failed: {e}")
+
+    # STRATEGY B: Fallback to Query Params (Old Method)
+    if user_name == "Valued Customer":
+        query_params = dict(websocket.query_params)
+        logger.info(f"🔍 Checking Query Params: {query_params}")
+        user_name = query_params.get("name", user_name)
+        call_notes = query_params.get("notes", call_notes)
     
     # Sanitize inputs (Handle double encoding like 'John%20Doe' -> 'John Doe')
     user_name = user_name.replace("+", " ").replace("%20", " ")
     call_notes = call_notes.replace("+", " ").replace("%20", " ")
 
-    logger.info(f"✅ AI Context Ready -> Name: {user_name} | Goal: {call_notes}")
+    logger.info(f"✅ FINAL CONTEXT -> Name: {user_name} | Goal: {call_notes}")
 
     # Shared State
     audio_input_queue = asyncio.Queue(maxsize=50) # Increased buffer size
@@ -311,6 +325,18 @@ async def handle_media_stream(websocket: WebSocket):
         except Exception:
             pass
         logger.info("✅ Session Closed.")
+
+# --- ROUTES ---
+
+# 1. New Robust Route (Accepts Base64 JSON in Path)
+@app.websocket("/media-stream/{encoded_context}")
+async def handle_path_context(websocket: WebSocket, encoded_context: str):
+    await run_media_stream(websocket, encoded_context)
+
+# 2. Legacy/Fallback Route (Accepts Query Params or no context)
+@app.websocket("/media-stream")
+async def handle_no_context(websocket: WebSocket):
+    await run_media_stream(websocket, None)
 
 if __name__ == '__main__':
     # Render provides PORT. Localhost defaults to 5000.
