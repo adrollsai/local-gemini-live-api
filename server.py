@@ -11,24 +11,20 @@ from fastapi import FastAPI, WebSocket
 from google import genai
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 # --- CONFIGURATION ---
-MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+MODEL = "gemini-2.0-flash-exp"
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-
-if not GOOGLE_API_KEY:
-    raise ValueError("Missing GOOGLE_API_KEY in .env file")
-
 PORT = int(os.environ.get("PORT", 5000))
 HOST = "0.0.0.0"
 
-# --- EXOTEL SPECS ---
+# Exotel Audio Specs
 CHUNK_SIZE = 3200 
 PACING_INTERVAL = 0.185
+SILENCE_THRESHOLD = 500 # Ignore audio quieter than this (adjust if needed)
 
-# --- LOGGING ---
+# Logging
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -39,7 +35,6 @@ logger = logging.getLogger("ExotelGemini")
 app = FastAPI()
 client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1alpha'})
 
-# --- AUDIO UTILS ---
 def telephony_to_gemini(media_payload):
     try:
         pcm_8k = base64.b64decode(media_payload)
@@ -55,17 +50,19 @@ def gemini_to_telephony(pcm_data):
         logger.error(f"Encode Error: {e}")
         return None
 
-# --- WEBSOCKET HANDLER ---
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
     
-    # 1. Capture Context
-    query_params = websocket.query_params
-    user_name = query_params.get("name", "Valued Customer")
-    call_notes = query_params.get("notes", "General inquiry")
+    # --- DEBUGGING CONTEXT ---
+    # Log the exact URL params we received to debug why name is missing
+    logger.info(f"🔍 FULL CONNECTION URL: {websocket.url}")
+    logger.info(f"🔍 RAW QUERY PARAMS: {websocket.query_params}")
+
+    user_name = websocket.query_params.get("name", "Valued Customer")
+    call_notes = websocket.query_params.get("notes", "General inquiry")
     
-    logger.info(f"✅ Connection: {user_name} | Goal: {call_notes}")
+    logger.info(f"✅ Context Loaded -> Name: {user_name} | Notes: {call_notes}")
 
     audio_input_queue = asyncio.Queue(maxsize=10)
     stream_sid = None
@@ -73,35 +70,30 @@ async def handle_media_stream(websocket: WebSocket):
     is_speaking = False 
     socket_lock = asyncio.Lock()
 
-    # 2. Stricter System Instruction
     SYSTEM_INSTRUCTION = f"""
-    You are an AI sales assistant for AdRolls calling {user_name}.
+    You are an AI assistant for AdRolls calling {user_name}.
+    Purpose: {call_notes}.
     
-    CRITICAL INSTRUCTION:
-    The purpose of this call is: {call_notes}.
-    
-    You MUST mention this purpose immediately after verifying the user's name.
-    Do not ask generic "How are you?" questions. Get straight to the point.
-    
-    Keep responses short (1-2 sentences).
+    IMPORTANT:
+    - You MUST acknowledge the purpose of the call in your very first sentence or immediately after they say hello.
+    - Keep it short.
     """
 
     config = {
         "response_modalities": ["AUDIO"],
         "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}
+            "voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}
         },
         "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]}
     }
 
     try:
         async with client.aio.live.connect(model=MODEL, config=config) as session:
-            logger.info(f"🔹 Connected to Gemini")
+            logger.info("🔹 Connected to Gemini")
             
-            # 3. Direct Initial Trigger
-            await session.send(input=f"Hello, I am calling from AdRolls regarding {call_notes}. Am I speaking with {user_name}?", end_of_turn=True)
+            # Send initial greeting immediately
+            await session.send(input=f"Hi, I'm calling from AdRolls about {call_notes}. Is this {user_name}?", end_of_turn=True)
 
-            # --- RECEIVE FROM EXOTEL ---
             async def receive_from_exotel():
                 nonlocal stream_sid, stream_key_name
                 last_speech_log = 0
@@ -116,27 +108,29 @@ async def handle_media_stream(websocket: WebSocket):
                             logger.info(f"🔑 Stream Started: {stream_sid}")
 
                         elif data.get("event") == "media":
-                            current_time = time.time()
-                            if current_time - last_speech_log > 2:
-                                logger.info("🎤 Receiving audio...")
-                                last_speech_log = current_time
-
                             payload = data["media"]["payload"]
                             pcm_16k = telephony_to_gemini(payload)
+                            
                             if pcm_16k:
+                                # SILENCE DETECTION: Only log if volume > threshold
+                                rms = audioop.rms(pcm_16k, 2)
+                                current_time = time.time()
+                                if rms > SILENCE_THRESHOLD and (current_time - last_speech_log > 2):
+                                    logger.info(f"🎤 User Speaking (RMS: {rms})")
+                                    last_speech_log = current_time
+
                                 if audio_input_queue.full():
                                     audio_input_queue.get_nowait()
                                 await audio_input_queue.put(pcm_16k)
                         
                         elif data.get("event") == "stop":
-                            logger.info("🛑 Call Stopped")
+                            logger.info("🛑 Exotel Stop Event")
                             break
                 except Exception as e:
                     logger.error(f"Exotel Rx Error: {e}")
                 finally:
                     await audio_input_queue.put(None)
 
-            # --- SEND TO GEMINI ---
             async def send_to_gemini():
                 try:
                     while True:
@@ -148,11 +142,9 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Gemini Tx Error: {e}")
 
-            # --- RECEIVE FROM GEMINI ---
             async def receive_from_gemini():
                 nonlocal is_speaking
                 out_buffer = b""
-                
                 try:
                     while True:
                         async for response in session.receive():
